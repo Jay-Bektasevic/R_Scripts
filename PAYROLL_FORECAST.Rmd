@@ -1,0 +1,753 @@
+---
+title: "Payroll Forecast"
+author: "Jay Bektasevic"
+date: "May 20, 2019"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    theme: united
+    toc: yes
+---
+
+
+
+## **Introduction**
+Forecast CPM payroll based on historical Class Code data. 
+
+
+## **Data**
+For this demonstration, we will use [ClearPath Mutual's](https://clearpathmutual.com) Rating Detail data. The data is stored in **SQL Server Database** - we will utilize **RODBC** package to get the data into R environment.  Any sensitive information will be scrubbed or obscured.  I have decided to use **RODBC** package because it allows the user to connect to the database without explicitly providing user id and password in the connection string, you simply need the name of your stored DSN.
+
+
+## **Method**
+We will utilize [R](https://www.r-project.org) software and SSMS for SQL script generation.
+
+
+## **Set-up and Data Import**
+
+First order of business is to load the required libraries.
+
+```{r message=FALSE, warning=FALSE, include=TRUE, paged.print=FALSE}
+
+#   List of packages to load:
+    packages <- c("RODBC", "tidyverse","dplyr",  "kableExtra", "dummies", "forecast", "xts", 
+                  "ggplot2", "data.table", "lubridate", "progress")
+  
+#   Check to see whether any packages aren't installed on the computer and install
+    new_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+    
+    if (length(new_packages))
+    install.packages(new_packages)
+  
+#   Load Neccessary Packages
+    sapply(packages, require, character.only = TRUE)
+    
+    setwd("K:/Departments/Accounting/Jay Bektasevic/Prem Forecast BREEZE")
+    
+    options(scipen = 999)
+  
+```
+
+
+
+Since we decided to use an external SQL script, we will need to create a helper function **Clean_SQL()**  to clean up the script of block comments, line endings, contiguous spaces, etc. 
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+    
+    Clean_SQL <- function(src, dest_var_name,src_pattern, dest_pattern) {
+            assign(
+                x = dest_var_name,
+                value = gsub(
+                          pattern = src_pattern,
+                          replacement = dest_pattern,
+                          x = src
+                          ),
+                envir = .GlobalEnv
+                )
+            }
+
+
+```
+
+
+Create a new function to utilize **Clean_SQL()** function to clean up SQL.
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+##################   ########################
+
+    clean_text <- function(fileName){
+        
+        original_text <- readChar(fileName, file.info(fileName)$size)
+    
+########################### Convert to UNIX line ending for ease of use #################################
+    
+        Clean_SQL(
+            src = original_text,
+            dest_var_name = 'unix_text',
+            src_pattern = '\r\n',
+            dest_pattern = '\n'
+        )
+    
+###################################### Remove Block Comments ############################################
+        Clean_SQL(
+            src = unix_text,
+            dest_var_name = 'wo_bc_text',
+            src_pattern = '/\\*.*?\\*/',
+            dest_pattern = ''
+        )
+    
+####################################### Remove Line Comments ############################################
+        Clean_SQL(
+            src = wo_bc_text,
+            dest_var_name = 'wo_bc_lc_text',
+            src_pattern = '--.*?\n',
+            dest_pattern = ''
+        )
+    
+############################### Remove Line Endings to get Flat Text ####################################
+        Clean_SQL(
+            src = wo_bc_lc_text,
+            dest_var_name = 'flat_text',
+            src_pattern = '\n',
+            dest_pattern = ' '
+        )
+    
+##################################### Remove Contiguous Spaces ##########################################
+        Clean_SQL(
+            src = flat_text,
+            dest_var_name = 'clean_flat_text',
+            src_pattern = ' +',
+            dest_pattern = ' '
+        )
+    }
+```
+
+
+
+
+
+
+We will create a function **get_premiums()** which will be used to dynamically change contents of the SQL script which in turn will be passed to SQL server for execution.  This function will be utilized in a for loop to iterate through multiple years.  
+We will utilize **odbcConnect()** function out of **RODBC** package to set up a connection to the Database. I already have a pre set up **DSN** on my machine 
+which will come in handy as I only have to put the DSN name and it will establish a connection without explicitly passing user id and password in the connection string.
+We will also point to our SQL file which will be used to query data from the database. I explicitly chose this way to do it because it allows me to concurrently update SQL script in SSMS as the need arises which allows me to simply rerun the code in R to update the results from SQL query changes.
+
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+  
+
+    get_premiums <- function(policy_yr, as_of) {
+    
+#################################### Read in SQL File Contents ##########################################
+        # policy_yr <- 2018
+        # as_of <- "12/31/2018"
+        
+        pre_sql <- paste0("DECLARE @policy_year INT= ", policy_yr, "; ",
+                          "DECLARE @AsOf DATE = '", as_of, "';"
+        )
+       
+        fileName <- "PY Premium by Class Code.sql"
+        
+        clean_flat_text <- clean_text(fileName)
+    
+    
+#########################################################################################################
+#                                                                                                       #
+#                               Create a channel to connect to SQL SERVER                               #
+#                                                                                                       #
+#########################################################################################################
+    
+        con  <-  odbcConnect("RSQL_BI") # "RSQL" is a pre set-up DSN on my machine
+    
+########################################### RUN SQL CODE ################################################
+    
+        clean_sql <- paste0(pre_sql, clean_flat_text)
+    
+        data <- sqlQuery(con, clean_sql)
+    
+#########################################################################################################
+#                                                                                                       #
+# Here we will recreate CPM premium levels to make sure that our algorithm matches what we have in the  #
+# system.                                                                                               #
+#                                                                                                       #
+#########################################################################################################
+    
+    
+############################################# PAYROLL ###################################################
+    
+    #  sum(data$EXPOSURE_AMOUNT) 
+    
+########################################## MANUAL PREMIUM ###############################################
+    
+        data[data$EXPOSURE_AMOUNT == 0, which(colnames(data) == "EXPOSURE_AMOUNT")] <-  0.00000000001
+    
+    #   These class Codes are fixed c(913, 908 )
+    
+        data$MANUAL_PREMIUM <- ifelse(
+            data$CLASS_CODE %in% c(913, 908) ,
+            data$EXPOSURE_AMOUNT * data$PAYROLL_RATE,
+            (data$EXPOSURE_AMOUNT / 100) * data$PAYROLL_RATE
+        )
+    
+######################################### MODIFIED PREMIUM ##############################################
+    
+        data$EFFECTIVE_DATE <- as.Date(data$EFFECTIVE_DATE, "%m-%d-%Y")
+        data$EXPIRATION_DATE <- as.Date(data$EXPIRATION_DATE, "%m-%d-%Y")
+    
+    #   Identify jan and feb deductable policies because the deductable credit comes after SCHCR becaseu we did not adopt NCCI rates until 3/1/2018.
+        jan_feb_ded_ins <- unique(data[data$EFFECTIVE_DATE < as.Date("03-01-2018", "%m-%d-%Y") & !is.na(data$DEDUCTIBLE_RATE), 3])
+    
+    #   Fix the policies that have no mod to 1
+        data[is.na(data$EMOD_RATE)  , which(colnames(data) == "EMOD_RATE")] <- 1
+    
+    
+    #   Please note that this calculation excludes deductable credit for deductable policies with effective date of < 3/1/2018.
+    #   For these policies - apply deductable credit after SCHCR to give you Standard Premium.
+    
+        data$MOD_PREM <- data$MANUAL_PREMIUM * (ifelse(
+            !is.na(data$DEDUCTIBLE_RATE) &
+                !data$INSURED_NUMBER %in% jan_feb_ded_ins,
+            (1 - as.numeric(data$DEDUCTIBLE_RATE / 100)),
+            1
+        )) * (ifelse(
+            !is.na(data$SHORT_RATE_PENALTY),
+            as.numeric(data$SHORT_RATE_PENALTY),
+            1
+        ))  * (as.numeric(data$EMOD_RATE))
+        
+    
+######################################### STANDARD PREMIUM ##############################################
+    
+    #   First, we need to get the total exposure of each polcy to use for minimum adjustment so to 
+    #   allocate correct amount of minimum adjustment for each class code.
+    
+        pol_exposure <- data %>%
+            
+            select(
+                POLICY_ID,
+                   EXPOSURE_AMOUNT) %>%
+            
+            group_by(POLICY_ID) %>%
+            
+            summarise(pol_exposure = sum(EXPOSURE_AMOUNT))
+        
+        
+        data <- data %>%
+            left_join(pol_exposure, by = "POLICY_ID") %>%
+            mutate(pct_of_total_exposure = (EXPOSURE_AMOUNT / pol_exposure))
+        
+        
+        data$STANDARD_PREMIUM <-
+            data$MOD_PREM * ifelse(!is.na(data$CREDIT_RATE),  (1 - as.numeric(data$CREDIT_RATE) / 100), 1) *
+            
+            ifelse(data$INSURED_NUMBER %in% jan_feb_ded_ins & !is.na(data$DEDUCTIBLE_RATE), (1 - as.numeric(data$DEDUCTIBLE_RATE / 100)), 1)  + 
+            
+            #   Add minimum premium adjustment for policies that require it.
+            ifelse(
+                !is.na(data$MIN_PREM_ADJUSTMENT),
+                (data$MIN_PREM_ADJUSTMENT * data$pct_of_total_exposure), 0
+            )
+    
+    
+########################################## POLICY PREMIUM ###############################################
+    
+        data$POLICY_PREMIUM <-
+            data$STANDARD_PREMIUM * ifelse(!is.na(data$DISCOUNT_RATE),  (1 - as.numeric(data$DISCOUNT_RATE) / 100), 1) +
+            
+            #   Apply terrorism Act and DTEC Act for every 100 of payroll
+            ifelse(!is.na(data$TIA_RATE),
+                   (as.numeric(data$TIA_RATE) / 100) * (data$EXPOSURE_AMOUNT / 100),
+                   0) +
+            ifelse(!is.na(data$DTC_RATE),
+                   (as.numeric(data$DTC_RATE) / 100) * (data$EXPOSURE_AMOUNT / 100),
+                   0)
+        
+        
+        return(data)
+        
+        
+    }  
+
+
+    
+```
+
+
+Now that we have created **get_premiums()** function , we can Run it in a for loop and bind the multi-year results in one data frame **prems_final**. 
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+    prems <- NULL
+    prems_final <- NULL
+    
+    
+    
+    for (i in 2005:2019) {
+        
+        gc()
+        print(paste0("Please Wait...Now Fetching ", i, " Premiums from BREEZE...Query run on: ", Sys.time()))
+        prems <- get_premiums(policy_yr = i, as_of = "06/30/2019")
+        prems_final <- rbind(prems_final, prems)
+        if (i == 2019)
+            cat(" Job Complete!\n ")
+    }
+
+```
+
+
+## **Modeling**
+
+
+We will now utilize **dplyr**  functions to get our data in a format for modeling.
+
+
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+
+  data <-   prems_final %>%
+      mutate(
+          qtr_date = as.Date(as.yearqtr(EFFECTIVE_DATE, format = "Q%q/%y"), frac = 1)
+  
+      ) %>%
+      select(
+          qtr_date,
+          #qtr,
+          CLASS_CODE,
+          
+          EXPOSURE_AMOUNT
+          # MANUAL_PREMIUM,
+          # MOD_PREM,
+          # STANDARD_PREMIUM,
+          # POLICY_PREMIUM
+          
+      ) %>%
+      group_by(qtr_date,
+               #qtr
+               CLASS_CODE
+      ) %>%
+      summarise(
+          PAYROLL = round(sum(EXPOSURE_AMOUNT), 0)
+          # MANUAL_PREMIUM = round(sum(MANUAL_PREMIUM), 0),
+          # MOD_PREMIUM = round(sum(MOD_PREM), 0),
+          # STD_PREMIUM = round(sum(STANDARD_PREMIUM), 0),
+          #POLICY_PREMIUM =  round(sum(POLICY_PREMIUM), 0)
+          
+      ) %>% 
+      spread(
+          CLASS_CODE,
+          PAYROLL
+      )
+
+#   Replace NA's with a very small number. The reason we use a small number instead of zero is that you cannot log-transform 0.
+    data[is.na(data)] <- 0.0000000000001
+    
+#   Enter # of columns (Class Codes) to  be projected (Do NOT change this number)
+    n.sim <- ncol(data) 
+
+```
+
+
+
+Now that we have data in a format suitable for modeling we can iterate through each class code and forecast payrolls for each class code 20 qtrs in the future. We will utilize the Holt-Winters method where trend and seasonality are present otherwise we will ETS (Exponential Smoothing – which is a technique to make forecasts by using a weighted mean of past values, wherein more recent values are given higher weights.)
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+
+#   Create an object to store model prediction results for each of the Class Codes.
+
+    output <- as.data.frame(matrix(0, ncol = n.sim, nrow = 20)) 
+
+############################################### FORECAST ################################################
+
+    for(i in 2:n.sim){
+        print(paste0("Now Forecasting Payroll For Class Code: ", names(data)[i]))
+      
+#       i = which(colnames(data) == 8810)
+        values <- data[,i]
+#       values <- log2(values)    #Log treatement
+#       values[mapply(is.infinite,values)] <- 0.00000001   #Treat zero's 
+        
+#       CREATE TIME SERIES      
+        prem_ts <- as.xts(ts(values, start = c(2005,1), frequency = 4)) 
+      
+        #FORECAST USING HOLT-WINTERS METHOD
+
+        fit <-  tryCatch({
+                  HoltWinters(prem_ts)
+                },
+                error = function(e) {
+                  ets(prem_ts)
+                })
+       
+#       Do NOT leave this uncommented will bog down!
+#       plot(fit)
+#       checkresiduals(fit)
+       
+        
+#       5-Year forecast
+        forecast <- forecast(fit,20)
+#        summary(forecast)
+        
+#       plot(forecast(fit,12), col=2, xlab="Year", ylab="Payroll", 
+#         axis(1, at=seq(2005, year(Sys.time()) + 5 , length.out = 10)  ,  labels = seq(2005, year(Sys.time()) + 5 , length.out = 10) ),
+#         main= paste0("Payroll Forecast Class Code: ", colnames(data[,i])), pch=25)
+
+#       Point forecast is stored in "mean" object in forecast. forecasts under 500 will be taken as zero.
+        output[i] <- ifelse(forecast$mean < 500, 0, forecast$mean) 
+        names(output)[i] <- names(data[,i])
+      
+         if (i == n.sim)
+                cat(" Forecast Complete!\n ")
+       
+    } 
+
+
+```
+
+
+
+
+
+No we can tidy up the output and plot the results.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+ 
+#   Match the column names from the actuals and forecast numbers and merge them into one dataset.    
+    colnames(output)[1] <- colnames(data[,1])
+    output [, 1] <- seq.Date(as.Date(as.yearqtr(Sys.Date(), format = "Q%q/%y"), frac = 1), by = "quarter", length.out = 20)
+    
+    fnl_output <-  rbind(as.data.frame(data),  as.data.frame(output))
+  
+
+################################################# PLOT ##################################################
+
+
+cc <- "8810" #class code
+
+ggplot(data = fnl_output, aes(x = qtr_date)) +
+  geom_line(aes(y = fnl_output[, colnames(fnl_output) == cc], colour = "Actual"), size = 1.2) +
+  geom_line(data = fnl_output[fnl_output$qtr_date >= data[nrow(data), 1], ],
+            aes(y = fnl_output[fnl_output$qtr_date >= data[nrow(data), 1], colnames(fnl_output) == cc]  , colour = "Forecast"), size = 1.2) +
+  theme_bw() + theme(legend.title = element_blank()) + ylab("Payroll") + xlab("Year") +
+  geom_vline(xintercept = as.numeric(data[nrow(data), 1]), linetype = 2, colour = 1) +
+  ggtitle(paste0("Quarterly Payroll Forecast, Class Code: ", cc)) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0)) 
+  
+#   Aggregate by policy year  
+
+    py_pay <- fnl_output %>%
+#      Summarise accross all columns to get the total Payroll for each quarter.       
+       mutate(TOTAL = rowSums(.[2:ncol(fnl_output)]),
+              POL_YR = year(qtr_date)
+              ) %>%
+      select(
+        POL_YR,
+        TOTAL
+      ) %>%
+      group_by( POL_YR ) %>% 
+      summarise(PAYROLL = sum(TOTAL)
+                ) %>% as.data.frame()
+
+    ggplot(data = py_pay, aes(x = POL_YR)) +
+      geom_line(aes(y = py_pay[,2], colour = "Actual"), size = 1.2) +
+      geom_line(data = py_pay[py_pay$POL_YR > 2018, ],
+                aes(y = py_pay[py_pay$POL_YR > 2018, 2 ]  , colour = "Forecast"), size = 1.2) +
+     
+       theme_bw() + theme(legend.title = element_blank()) + ylab("Payroll") + xlab("Year") +
+      geom_vline(xintercept = 2019, linetype = 2, colour = 1) +
+      ggtitle(paste0("Payroll Forecast")) +
+      theme(axis.text.x = element_text(angle = 0, hjust = 0)) 
+
+```
+
+
+
+Now we will work on getting the wighted emod, SCHD, PCD trends to incorporate into the model to get to final premium.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+  cc_exposure <- prems_final %>%
+      
+        select(
+               POLICY_YEAR,
+               CLASS_CODE,
+               EXPOSURE_AMOUNT) %>%
+        group_by(
+              CLASS_CODE,
+              POLICY_YEAR) %>%
+        summarise(cc_exposure = sum(EXPOSURE_AMOUNT)) 
+    
+#   Merge with prems_final table    
+    prems_final <- prems_final %>%
+        left_join(cc_exposure, by = c("CLASS_CODE", "POLICY_YEAR") ) %>%
+        mutate(pct_PY_CC_exposure = (EXPOSURE_AMOUNT / cc_exposure)) 
+        
+
+  
+
+#   Get the weighted mods over the years to use to model what the EMON, SCD... will be to apply to payroll to get premium.    
+    prem_mods <- prems_final %>%
+      
+        mutate(
+            EMOD_W = ifelse(!is.na(EMOD_RATE), EMOD_RATE * pct_PY_CC_exposure, 0  )
+        ) %>%
+        select(
+            CLASS_CODE,
+            EXPOSURE_AMOUNT,
+            POLICY_YEAR,
+            yrs_insured,
+            PAYROLL_RATE,
+            EMOD_W,
+            CREDIT_RATE,
+            DEDUCTIBLE_RATE,
+            DISCOUNT_RATE,
+            #renewal_ratio,
+            pct_PY_CC_exposure
+            
+        ) %>%
+        group_by(
+            POLICY_YEAR,
+            CLASS_CODE
+        ) %>%
+        summarise(
+            INSURED_LONGEVITY = sum(yrs_insured * pct_PY_CC_exposure),
+            PAYROLL = sum(EXPOSURE_AMOUNT),
+            RATE = mean(PAYROLL_RATE),
+            W_EMOD = sum(EMOD_W),
+            w_SCD = sum(ifelse(!is.na(CREDIT_RATE), CREDIT_RATE * pct_PY_CC_exposure, 0  )),
+            w_DED = sum(ifelse(!is.na(DEDUCTIBLE_RATE), DEDUCTIBLE_RATE * pct_PY_CC_exposure, 0  )),
+            w_PCD = sum(ifelse(!is.na(DISCOUNT_RATE), DISCOUNT_RATE * pct_PY_CC_exposure, 0  )),
+            #w_RE_RATIO = sum(ifelse(!is.na(renewal_ratio), renewal_ratio * pct_total_exposure, 0  ))
+            #RATIO = mean(ifelse(!is.na(renewal_ratio), renewal_ratio , 0  ))
+            
+        )
+  
+    
+```
+
+
+
+Here we will restructure our final data to be able to match it with the weighted mods to calculate the premium.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+
+prem_fcast <- fnl_output %>%
+  filter(
+    year(qtr_date) >= year(Sys.Date()) 
+  ) %>%
+  gather(
+  
+     CLASS_CODE,
+     PAYROLL,
+     colnames(fnl_output)[2]:colnames(fnl_output)[ncol(fnl_output)]
+   
+  ) %>%
+  mutate(
+    CLASS_CODE = as.integer(CLASS_CODE)
+  ) %>%
+  left_join((prem_mods %>%
+               filter(POLICY_YEAR == "2018") %>%
+               select(
+                 -PAYROLL
+               )
+             
+             )
+            , by = "CLASS_CODE") %>%
+  replace(is.na(.), 0)
+
+
+```
+
+
+
+Now we need to apply the algorithm to the **prem_fcast** dataset to get the forcasted premium.
+
+
+
+
+
+Here we will apply an algorithm to claculated forcasted premium.
+**Make sure to bring in current rates.** <-- Have sent out a request to Devi.
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+fileName <- "Class Code Rates for NCCI Financial Call Reporting.sql"
+con  <-  odbcConnect("RSQL_BI")
+
+clean_flat_text <- clean_text(fileName)
+rates <- sqlQuery(con, clean_flat_text)
+
+prem_fcast <- prem_fcast %>%
+  left_join( rates, by = "CLASS_CODE") %>%
+  select(
+    qtr_date,
+    CLASS_CODE,
+    PAYROLL,
+    W_EMOD,
+    w_SCD,
+    w_DED,
+    w_PCD,
+    CLASS_CODE_RATE,
+    STATE
+  ) %>%
+  mutate(
+    FCAST_YEAR = year(qtr_date)
+  )
+
+```
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+######################################### MANUAL PREMIUM ################################################
+
+    #   These class Codes are fixed c(913, 908 )
+    
+       prem_fcast$MANUAL_PREMIUM <- ifelse(
+            prem_fcast$CLASS_CODE %in% c(913, 908) ,
+            prem_fcast$PAYROLL * prem_fcast$CLASS_CODE_RATE,
+            (prem_fcast$PAYROLL / 100) * prem_fcast$CLASS_CODE_RATE
+        )
+    
+######################################### MODIFIED PREMIUM ##############################################
+
+
+    
+        prem_fcast$MOD_PREM <- prem_fcast$MANUAL_PREMIUM * (ifelse(
+            !is.na(prem_fcast$w_DED), 
+            (1 - as.numeric(prem_fcast$w_DED / 100)),
+            1
+        ))  * (as.numeric(prem_fcast$W_EMOD))
+        
+    
+######################################### STANDARD PREMIUM ##############################################
+
+        prem_fcast$STANDARD_PREMIUM <-
+            prem_fcast$MOD_PREM * ifelse(!is.na(prem_fcast$w_SCD),  (1 - as.numeric(prem_fcast$w_SCD) / 100), 1) 
+    
+########################################## POLICY PREMIUM ###############################################
+    
+        prem_fcast$POLICY_PREMIUM <-
+            prem_fcast$STANDARD_PREMIUM * ifelse(!is.na(prem_fcast$w_PCD),  (1 - as.numeric(prem_fcast$w_PCD) / 100), 1) +
+            
+            #   Apply terrorism Act and DTEC Act for every 100 of payroll
+           
+                   (0.7 / 100) * (prem_fcast$PAYROLL / 100) +
+         
+                   (1.4 / 100) * (prem_fcast$PAYROLL / 100)
+  
+
+
+```
+
+Summary of the forecast by policy year.
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+x <- prem_fcast %>%
+  select(
+    FCAST_YEAR,
+    PAYROLL,
+    MANUAL_PREMIUM,
+    MOD_PREM,
+    STANDARD_PREMIUM,
+    POLICY_PREMIUM
+  ) %>%
+  replace(is.na(.), 0) %>%
+  group_by(FCAST_YEAR) %>%
+  summarise(
+    PAYROLL_F = sum(PAYROLL),
+    MANUAL_PREMIUM_F =  sum(MANUAL_PREMIUM),
+    MOD_PREM_F = sum(MOD_PREM),
+    STANDARD_PREMIUM_F = sum(STANDARD_PREMIUM),
+    POLICY_PREMIUM_F = sum(POLICY_PREMIUM)
+  )
+
+x[1:5,]
+
+```
+
+
+Thus far what we’ve built is the naïve base model ¬(no assumptions).
+What we now need to do is determine what classes we will target more aggressively and which ones we’ll back off. We also need to determine premium mod trends (EMOD, SCD..etc). 
+We also need to determine how much new business we will pick up as well new business from state expansion. 
+
+**LEFT HERE on 7/2/19**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+**This was an attempt to forecast premium mods. however, since the class codes are inconsistent in the years that we have the values for and there is no trend or seasonality for the handful of data points the SES method returns basically the latest value that we have and therefore we will just use that instead of modeling it since the model will give us that value in perpetuity. **
+
+Model the mods. 
+#### NEED TO FIGURE OUT HOW TO GET CLASSCODES THAT HAVE VALUES FOR ALL YEARS TO BE MODELED OR SKIPPED DURING THE MODELING!!!
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+
+#   Create an object to store EMOD prediction results for each of the Class Codes.
+
+    emod_out <- as.data.frame(matrix(0, ncol = n.sim, nrow = 5)) 
+    ccs <- as.data.frame( unique(prem_mods[prem_mods$POLICY_YEAR == max(prem_mods$POLICY_YEAR)-1 ,  2]))
+############################################### FORECAST ################################################
+
+    for(i in 1: nrow(ccs)){
+#        print(paste0("Now Forecasting Mods For Class Code: ", names(data)[i]))
+      
+      i = 3
+        values <- prem_mods %>%
+          filter(
+            CLASS_CODE == ccs[i,]
+          ) 
+        
+        
+#       values <- log2(values)    #Log treatement
+#       values[mapply(is.infinite,values)] <- 0.00000001   #Treat zero's 
+        
+#       CREATE TIME SERIES      
+        prem_ts <- as.xts(ts(values$W_EMOD, start = c(2005,1), frequency = 1)) 
+      prem_ts <- as.xts(ts(values$RATE , start = c(2005,1), frequency = 1))
+        #FORECAST USING HOLT-WINTERS METHOD
+
+        fit <-  ets(prem_ts ,model = "ZZZ")
+
+         if(inherits(fit, "try-error")) next       
+       
+#       Do NOT leave this uncommented will bog down!
+#      plot(fit)
+#       checkresiduals(fit)
+       
+        
+#       5-Year forecast
+        forecast <- forecast(fit,5)
+        summary(forecast)
+        
+      plot(forecast(fit,5), col=2, xlab="Year", ylab="Payroll", 
+         #axis(1, at=seq(2005, year(Sys.time()) + 5 , length.out = 10)  ,  labels = seq(2005, year(Sys.time()) + 5 , length.out = 10) ),
+         main= paste0("Payroll Forecast Class Code: ", colnames(data[,i])), pch=25)
+
+#       Point forecast is stored in "mean" object in forecast. forecasts under 500 will be taken as zero.
+        emod_out[i] <-  forecast$mean
+        names(emod_out)[i] <- ccs[i,]
+      
+         if (i == nrow(ccs))
+                cat(" Forecast Complete!\n ")
+       
+    } 
+
+
+```
+
